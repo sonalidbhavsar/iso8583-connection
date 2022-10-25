@@ -1,11 +1,13 @@
 package connection
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"github.com/sethvargo/go-retry"
 )
 
 type ConnectionFactoryFunc func(addr string) (*Connection, error)
@@ -160,44 +162,56 @@ func (p *Pool) handleClosedConnection(closedConn *Connection) {
 
 	// initiate goroutine to reconnect to closedConn.Addr
 	p.wg.Add(1)
-	go p.recreateConnection(closedConn)
+	go p.retryCreateConnection(closedConn)
 }
 
-func (p *Pool) recreateConnection(closedConn *Connection) {
+func (p *Pool) retryCreateConnection(closedConn *Connection) {
 	defer p.wg.Done()
+
+	ctx := context.Background()
+	b := retry.NewExponential(p.Opts.BaseReconnectWait)
+	b = retry.WithCappedDuration(p.Opts.MaxReconnectWait, b)
+	err := retry.Do(ctx, b, func(ctx context.Context) error {
+		if errRecreateConn := p.recreateConnection(closedConn); errRecreateConn != nil {
+			return retry.RetryableError(errRecreateConn)
+		}
+		return nil
+	})
+	if err != nil {
+		p.handleError(fmt.Errorf("failed to re-create connection for %s: %w", closedConn.addr, err))
+	}
+}
+
+func (p *Pool) recreateConnection(closedConn *Connection) error {
 
 	var conn *Connection
 	var err error
-	for {
+	select {
+	case <-p.Done():
+		// if pool is closed, let's get out of here
+		return nil
+	default:
+		//  if pool is open, pass
+	}
+	conn, err = p.Factory(closedConn.addr)
+	if err != nil {
+		p.handleError(fmt.Errorf("failed to re-create connection for %s: %w", closedConn.addr, err))
+		return err
+	}
 
-		conn, err = p.Factory(closedConn.addr)
-		if err != nil {
-			p.handleError(fmt.Errorf("failed to re-create connection for %s: %w", closedConn.addr, err))
-			return
-		}
+	// set own handler when connection is closed
+	conn.SetOptions(ConnectionClosedHandler(p.handleClosedConnection))
 
-		// set own handler when connection is closed
-		conn.SetOptions(ConnectionClosedHandler(p.handleClosedConnection))
-
-		err = conn.Connect()
-
-		if err == nil {
-			break
-		}
-
+	err = conn.Connect()
+	if err != nil {
 		p.handleError(fmt.Errorf("failed to reconnect to %s: %w", conn.addr, err))
-		select {
-		case <-time.After(p.Opts.ReconnectWait):
-			continue
-		case <-p.Done():
-			// if pool is closed, let's get out of here
-			return
-		}
+		return err
 	}
 
 	p.mu.Lock()
 	p.connections = append(p.connections, conn)
 	p.mu.Unlock()
+	return nil
 }
 
 // Close closes all connections in the pool
