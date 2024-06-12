@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var ErrNoConnections = errors.New("no connections (online)")
+
 type ConnectionFactoryFunc func(addr string) (*Connection, error)
 
 type Pool struct {
@@ -118,7 +120,7 @@ func (p *Pool) Get() (*Connection, error) {
 	conns := p.filteredConnections()
 
 	if len(conns) == 0 {
-		return nil, errors.New("no (filtered) connections in the pool")
+		return nil, ErrNoConnections
 	}
 
 	n := atomic.AddUint32(&p.connIndex, 1)
@@ -168,8 +170,8 @@ func (p *Pool) recreateConnection(closedConn *Connection) {
 
 	var conn *Connection
 	var err error
+	var reconnectTime = p.Opts.BaseReconnectWait
 	for {
-
 		conn, err = p.Factory(closedConn.addr)
 		if err != nil {
 			p.handleError(fmt.Errorf("failed to re-create connection for %s: %w", closedConn.addr, err))
@@ -186,8 +188,13 @@ func (p *Pool) recreateConnection(closedConn *Connection) {
 		}
 
 		p.handleError(fmt.Errorf("failed to reconnect to %s: %w", conn.addr, err))
+
 		select {
-		case <-time.After(p.Opts.ReconnectWait):
+		case <-time.After(reconnectTime):
+			reconnectTime *= 2
+			if reconnectTime > p.Opts.MaxReconnectWait {
+				reconnectTime = p.Opts.MaxReconnectWait
+			}
 			continue
 		case <-p.Done():
 			// if pool is closed, let's get out of here
